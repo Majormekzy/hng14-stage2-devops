@@ -322,4 +322,4 @@ jobs:
               echo "Health check failed - rolling back"
               docker compose down
               exit 1
-            fi"
+            fi
