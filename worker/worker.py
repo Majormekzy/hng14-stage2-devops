@@ -6,13 +6,16 @@ import sys
 
 running = True
 
+
 def handle_signal(signum, frame):
     global running
     print("Shutdown signal received, finishing current job...")
     running = False
 
+
 signal.signal(signal.SIGTERM, handle_signal)
 signal.signal(signal.SIGINT, handle_signal)
+
 
 def get_redis():
     return redis.Redis(
@@ -22,11 +25,13 @@ def get_redis():
         decode_responses=True
     )
 
+
 def process_job(r, job_id):
     print(f"Processing job {job_id}")
     time.sleep(2)
     r.hset(f"job:{job_id}", "status", "completed")
     print(f"Done: {job_id}")
+
 
 def main():
     r = get_redis()
@@ -38,6 +43,7 @@ def main():
             process_job(r, job_id)
     print("Worker shut down cleanly")
     sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
