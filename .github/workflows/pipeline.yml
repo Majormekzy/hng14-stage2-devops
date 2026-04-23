@@ -1,0 +1,359 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: ["*"]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: Lint Python (api)
+        run: flake8 api/main.py --max-line-length=100
+
+      - name: Lint Python (worker)
+        run: flake8 worker/worker.py --max-line-length=100
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Install frontend dependencies
+        run: cd frontend && npm ci
+
+      - name: Install eslint
+        run: cd frontend && npm install --save-dev eslint
+
+      - name: Lint JavaScript
+        run: cd frontend && npx eslint app.js --env node --env es6 --parser-options=ecmaVersion:2020
+
+      - name: Lint Dockerfiles (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: api/Dockerfile
+
+      - name: Lint worker Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: worker/Dockerfile
+
+      - name: Lint frontend Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: frontend/Dockerfile
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install fastapi uvicorn redis pytest pytest-cov httpx
+
+      - name: Write unit tests
+        run: |
+          cat > test_api.py << 'TESTS'
+          import pytest
+          from unittest.mock import patch, MagicMock
+          from fastapi.testclient import TestClient
+          from api.main import app
+
+          client = TestClient(app)
+
+          @patch("api.main.get_redis")
+          def test_create_job(mock_redis):
+              mock_r = MagicMock()
+              mock_redis.return_value = mock_r
+              response = client.post("/jobs")
+              assert response.status_code == 200
+              assert "job_id" in response.json()
+              mock_r.lpush.assert_called_once()
+              mock_r.hset.assert_called_once()
+
+          @patch("api.main.get_redis")
+          def test_get_job_found(mock_redis):
+              mock_r = MagicMock()
+              mock_r.hget.return_value = "completed"
+              mock_redis.return_value = mock_r
+              response = client.get("/jobs/test-job-123")
+              assert response.status_code == 200
+              assert response.json()["status"] == "completed"
+
+          @patch("api.main.get_redis")
+          def test_get_job_not_found(mock_redis):
+              mock_r = MagicMock()
+              mock_r.hget.return_value = None
+              mock_redis.return_value = mock_r
+              response = client.get("/jobs/nonexistent")
+              assert response.status_code == 404
+
+          @patch("api.main.get_redis")
+          def test_health_endpoint(mock_redis):
+              response = client.get("/health")
+              assert response.status_code == 200
+              assert response.json() == {"status": "healthy"}
+
+          @patch("api.main.get_redis")
+          def test_create_job_returns_uuid(mock_redis):
+              mock_r = MagicMock()
+              mock_redis.return_value = mock_r
+              response = client.post("/jobs")
+              data = response.json()
+              assert "job_id" in data
+              assert len(data["job_id"]) == 36
+          TESTS
+
+      - name: Create __init__.py
+        run: touch api/__init__.py
+
+      - name: Run tests with coverage
+        run: pytest test_api.py -v --cov=api --cov-report=xml --cov-report=html
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: htmlcov/
+
+  build:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      registry: localhost:5000
+      sha: ${{ github.sha }}
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./api
+          push: true
+          tags: |
+            localhost:5000/api:${{ github.sha }}
+            localhost:5000/api:latest
+          network: host
+
+      - name: Build and push worker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./worker
+          push: true
+          tags: |
+            localhost:5000/worker:${{ github.sha }}
+            localhost:5000/worker:latest
+          network: host
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            localhost:5000/frontend:${{ github.sha }}
+            localhost:5000/frontend:latest
+          network: host
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: Rebuild images for scanning
+        run: |
+          docker buildx build --load -t localhost:5000/api:latest ./api
+          docker buildx build --load -t localhost:5000/worker:latest ./worker
+          docker buildx build --load -t localhost:5000/frontend:latest ./frontend
+
+      - name: Run Trivy on API
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: localhost:5000/api:latest
+          format: sarif
+          output: trivy-api.sarif
+          severity: CRITICAL
+          exit-code: "1"
+
+      - name: Run Trivy on worker
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: localhost:5000/worker:latest
+          format: sarif
+          output: trivy-worker.sarif
+          severity: CRITICAL
+          exit-code: "1"
+
+      - name: Run Trivy on frontend
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: localhost:5000/frontend:latest
+          format: sarif
+          output: trivy-frontend.sarif
+          severity: CRITICAL
+          exit-code: "1"
+
+      - name: Upload Trivy SARIF results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-results
+          path: "*.sarif"
+
+  integration:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: security
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env for integration test
+        run: echo "REDIS_PASSWORD=testpassword123" > .env
+
+      - name: Build and start stack
+        run: docker compose up --build -d
+
+      - name: Wait for all services to be healthy
+        run: |
+          echo "Waiting for services..."
+          for i in $(seq 1 30); do
+            STATUS=$(docker compose ps --format json | python3 -c "
+          import sys, json
+          data = sys.stdin.read().strip().split('\n')
+          services = [json.loads(d) for d in data if d]
+          unhealthy = [s['Name'] for s in services if 'healthy' not in s.get('Health', 'healthy')]
+          print(','.join(unhealthy))
+          ")
+            if [ -z "$STATUS" ]; then
+              echo "All services healthy!"
+              break
+            fi
+            echo "Waiting... unhealthy: $STATUS"
+            sleep 5
+          done
+
+      - name: Submit a job and verify completion
+        run: |
+          # Submit job
+          JOB_RESPONSE=$(curl -s -X POST http://localhost:3000/submit)
+          echo "Job response: $JOB_RESPONSE"
+          JOB_ID=$(echo $JOB_RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+          echo "Job ID: $JOB_ID"
+
+          # Poll until completed (max 30 seconds)
+          for i in $(seq 1 15); do
+            STATUS=$(curl -s http://localhost:3000/status/$JOB_ID | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))")
+            echo "Status: $STATUS"
+            if [ "$STATUS" = "completed" ]; then
+              echo "Job completed successfully!"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Job did not complete in time"
+          exit 1
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -v
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: integration
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to server with rolling update
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            cd ~/hng14-stage2-devops
+            git pull origin main
+
+            # Build new images
+            docker compose build
+
+            # Rolling update — start new, verify health, stop old
+            for SERVICE in api worker frontend; do
+              echo "Updating $SERVICE..."
+
+              # Start new container alongside old
+              docker compose up -d --no-deps --scale ${SERVICE}=2 ${SERVICE} 2>/dev/null || true
+
+              # Wait for health check (60 seconds max)
+              HEALTHY=false
+              for i in $(seq 1 12); do
+                HEALTH=$(docker compose ps ${SERVICE} --format json 2>/dev/null | tail -1 | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Health',''))" 2>/dev/null || echo "")
+                if [ "$HEALTH" = "healthy" ]; then
+                  HEALTHY=true
+                  break
+                fi
+                echo "Waiting for $SERVICE to be healthy... ($i/12)"
+                sleep 5
+              done
+
+              if [ "$HEALTHY" = "true" ]; then
+                docker compose up -d --no-deps --scale ${SERVICE}=1 ${SERVICE}
+                echo "$SERVICE updated successfully"
+              else
+                echo "$SERVICE health check failed — keeping old container"
+                docker compose up -d --no-deps --scale ${SERVICE}=1 ${SERVICE} 2>/dev/null || true
+                exit 1
+              fi
+            done
+
+            echo "Deployment complete"
