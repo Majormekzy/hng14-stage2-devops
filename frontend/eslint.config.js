@@ -11,6 +11,9 @@ module.exports = [
         console: "readonly",
         __dirname: "readonly",
       }
+    },
+    rules: {
+      "no-unused-vars": ["error", { "caughtErrors": "none" }]
     }
   }
 ];
