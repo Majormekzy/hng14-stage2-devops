@@ -295,25 +295,31 @@ jobs:
           script: |
             cd ~/hng14-stage2-devops
             git pull origin main
+
+            # Build new images
             docker compose build
-            for SERVICE in api worker frontend; do
-              echo "Updating $SERVICE..."
-              docker compose up -d --no-deps ${SERVICE}
-              HEALTHY=false
-              for i in $(seq 1 12); do
-                HEALTH=$(docker inspect --format='{{.State.Health.Status}}' hng14-stage2-devops-${SERVICE}-1 2>/dev/null || echo "unknown")
-                if [ "$HEALTH" = "healthy" ]; then
-                  HEALTHY=true
-                  break
-                fi
-                echo "Waiting for $SERVICE to be healthy... ($i/12)"
-                sleep 5
-              done
-              if [ "$HEALTHY" = "true" ]; then
-                echo "$SERVICE updated successfully"
-              else
-                echo "$SERVICE health check failed"
-                exit 1
+
+            # Bring up full stack (dependencies handled by compose)
+            docker compose up -d
+
+            # Wait up to 60s for api and frontend to be healthy
+            echo "Waiting for services to be healthy..."
+            HEALTHY=false
+            for i in $(seq 1 12); do
+              API=$(docker inspect --format='{{.State.Health.Status}}' hng14-stage2-devops-api-1 2>/dev/null || echo "unknown")
+              FRONTEND=$(docker inspect --format='{{.State.Health.Status}}' hng14-stage2-devops-frontend-1 2>/dev/null || echo "unknown")
+              echo "API: $API | Frontend: $FRONTEND"
+              if [ "$API" = "healthy" ] && [ "$FRONTEND" = "healthy" ]; then
+                HEALTHY=true
+                break
               fi
+              sleep 5
             done
-            echo "Deployment complete"
+
+            if [ "$HEALTHY" = "true" ]; then
+              echo "Deployment complete - all services healthy"
+            else
+              echo "Health check failed - rolling back"
+              docker compose down
+              exit 1
+            fi"
