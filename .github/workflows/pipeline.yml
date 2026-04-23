@@ -36,7 +36,7 @@ jobs:
         run: cd frontend && npm ci
 
       - name: Install eslint
-        run: cd frontend && npm install --save-dev eslint
+        run: cd frontend && npm install --save-dev eslint @eslint/js
 
       - name: Lint JavaScript
         run: cd frontend && npx eslint app.js
